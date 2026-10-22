@@ -1,0 +1,11 @@
+name: base
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - python=3.11
+  - pip
+  - mafft=7.526
+  - raxml-ng>=1.2,<3
+  - ncbi-datasets-cli>=18,<19
+  - coreutils

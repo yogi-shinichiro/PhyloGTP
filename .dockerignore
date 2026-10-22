@@ -1,0 +1,16 @@
+.git
+.env
+.env.*
+!.env.example
+.venv
+__pycache__
+*.pyc
+genome_runs
+busco_downloads
+docs
+tests
+*.fasta
+*.faa
+*.zip
+*.raxml.*
+*.log
