@@ -9,15 +9,39 @@ from get_CDS_v3 import get_cds
 from phylogeny_CDS import make_tree
 from Bio import Phylo
 import matplotlib.pyplot as plt
+from io import BytesIO
+from pathlib import Path
 from ai_gene import suggest_genes
-from gene_info import get_gene_info, explain_gene
+from gene_info import get_gene_info, explain_gene, GeneInfoConnectionError, GeneNotFoundError
+
+
+def update_species_from_search(gene_name, species, mode, result_key, groups):
+    selected = st.session_state[result_key]
+    if mode == "🗂️ 分類群から選ぶ":
+        store = st.session_state.setdefault("group_species_selection", {})
+        values = set(store.get(gene_name, []))
+        if selected:
+            values.add(species)
+        else:
+            values.discard(species)
+        store[gene_name] = sorted(values)
+        for group, items in groups.items():
+            if any(item["species"] == species for item in items):
+                st.session_state[f"group_species::{gene_name}::{group}::{species}"] = selected
+    else:
+        values = set(st.session_state.get("species_all", []))
+        if selected:
+            values.add(species)
+        else:
+            values.discard(species)
+        st.session_state["species_all"] = sorted(values)
 
 
 @st.cache_data(ttl=86400, max_entries=256, show_spinner=False)
 def cached_gene_info(symbol):
     info = get_gene_info(symbol)
     if info is None:
-        raise ValueError(f"{symbol}: NCBI Geneで確認できませんでした。")
+        raise GeneNotFoundError(f"{symbol}: NCBI Geneでヒトの遺伝子を確認できませんでした。")
     return info
 
 
@@ -28,6 +52,7 @@ def cached_explanation(info):
 
 @st.cache_data(ttl=3600, max_entries=128, show_spinner=False)
 def cached_candidates(query):
+    # Candidate response v3 uses concise reasons and a bounded response.
     return suggest_genes(query)
 
 from ortholog import get_all_orthologs
@@ -92,6 +117,7 @@ def species_label(scientific_name, custom_names=None):
 st.title("🌳 PhyloGPT")
 
 
+
 st.write(
     "調べたい特徴から遺伝子候補を探し、"
     "NCBIのオルソログ情報を使って比較する生物を選び、系統樹を自動作成します。"
@@ -119,12 +145,9 @@ if st.button("🔍 AIで候補を探す"):
             with st.spinner("AIが遺伝子候補を探しています..."):
                 candidates = cached_candidates(ai_query.strip())
 
-            st.session_state["gene_candidates"] = list(dict.fromkeys(
-                item["gene"].strip().upper()
-                for item in candidates
-                if isinstance(item, dict) and isinstance(item.get("gene"), str)
-                and item["gene"].strip()
-            ))
+            st.session_state["gene_candidates"] = [item["gene"] for item in candidates]
+            st.session_state["gene_candidate_reasons"] = {item["gene"]: item["reason"] for item in candidates}
+            st.session_state["gene_candidate_query"] = ai_query.strip()
 
         except Exception as e:
             st.error("AI検索中にエラーが発生しました。")
@@ -140,25 +163,48 @@ candidates = st.session_state.get("gene_candidates", [])
 
 if candidates:
     st.write("### 🧬 AIが見つけた候補")
+    candidate_query = st.session_state.get("gene_candidate_query")
+    if candidate_query:
+        st.write("検索内容：", candidate_query)
+        if ai_query.strip() != candidate_query:
+            st.info("以下は前回の検索結果です。入力を変えた場合は「AIで候補を探す」を押してください。")
+    st.caption("提案理由はAIが生成した説明です。NCBIの原文と照合して候補を検討してください。")
     selected_gene = st.radio(
         "系統解析に使用する遺伝子を選択してください", candidates
     )
     st.caption("各候補の「詳しい説明を見る」を開くと、NCBI原文と生成済みの日本語説明を確認できます。")
     generate_explanations = st.button("💡 全候補の日本語AI説明を生成・再試行")
+    # Clicking reruns failed lookups; successful entries remain cached.
+    st.button("🔄 NCBI情報の取得を再試行", key="retry_ncbi_gene_info")
     explanations = st.session_state.setdefault("gene_explanations", {})
 
     for candidate in candidates:
         st.divider()
+        st.subheader(f"🧬 {candidate}")
+        reason = st.session_state.get("gene_candidate_reasons", {}).get(candidate)
+        if reason:
+            st.write("**この遺伝子を候補にした理由（AI生成）**")
+            st.write(reason)
+        else:
+            st.caption("この候補には提案理由が保存されていません。「AIで候補を探す」で再検索してください。")
         try:
             with st.spinner(f"{candidate} の情報をNCBIから取得しています..."):
                 info = cached_gene_info(candidate)
+        except GeneInfoConnectionError as e:
+            st.warning(f"{candidate}：NCBIとの通信に失敗しました。遺伝子が存在しないという判定ではありません。上の「NCBI情報の取得を再試行」を押してください。")
+            with st.expander(f"{candidate} の通信エラー詳細", expanded=False):
+                st.exception(e)
+            continue
+        except GeneNotFoundError:
+            st.warning(f"{candidate}：NCBI Geneでヒトの遺伝子を確認できませんでした。AIが提示した遺伝子名の誤りも考えられるため、正式なシンボルを確認するかAI検索をやり直してください。")
+            continue
         except Exception as e:
-            st.subheader(f"🧬 {candidate}")
-            st.warning(f"{candidate} の情報を取得できませんでした。再試行してください。")
-            st.exception(e)
+            st.warning(f"{candidate} の情報を取得できませんでした。")
+            with st.expander(f"{candidate} のエラー詳細", expanded=False):
+                st.exception(e)
             continue
 
-        st.subheader(f"🧬 {candidate} — {info['name']}")
+        st.write("**正式名称：**", info["name"])
         with st.expander("詳しい説明を見る", expanded=False):
             st.write("#### NCBI Geneの説明全文（原文）")
             st.write(info["summary"])
@@ -307,10 +353,11 @@ if (
             )
             if st.form_submit_button("🔍 検索"):
                 st.session_state["applied_species_query"] = query_input.strip()
+        search_results = st.container()
         applied_query = st.session_state.get("applied_species_query", "")
         species_query = applied_query.casefold()
         st.caption(
-            "検索語を入力して「🔍 検索」を押してください。分類群の一覧では一致した種に🔎を表示し、全種から選ぶ場合は候補を絞り込みます。"
+            "検索語を入力して「🔍 検索」を押してください。検索結果は検索欄のすぐ下に表示します。全種から選ぶ場合は候補も絞り込みます。"
             "日本語は登録済みの主要種に対応します。検索中も選択済みの種は残ります。"
         )
         if species_query:
@@ -337,20 +384,36 @@ if (
             })
             # Durable selection survives filtering and switching selection modes.
             selection_store = st.session_state.setdefault("group_species_selection", {})
+            preferred_species = {
+                "哺乳類": ["Homo sapiens", "Mus musculus"],
+                "鳥類": ["Gallus gallus"],
+                "爬虫類": ["Anolis carolinensis"],
+                "両生類": ["Xenopus tropicalis", "Xenopus laevis"],
+                "魚類": ["Danio rerio", "Oryzias latipes"],
+            }
+            initial_species = []
+            for group in visible_groups:
+                available = sorted({item["species"] for item in classified_groups.get(group, [])})
+                if available:
+                    chosen = next((name for name in preferred_species.get(group, []) if name in available), available[0])
+                    initial_species.append(chosen)
+            reset_defaults = st.button("各分類群から1種ずつ選び直す", key="reset_group_defaults")
+            if ortholog_gene not in selection_store or reset_defaults:
+                selection_store[ortholog_gene] = initial_species
+                for group in visible_groups:
+                    for item in classified_groups.get(group, []):
+                        species = item["species"]
+                        st.session_state[f"group_species::{ortholog_gene}::{group}::{species}"] = species in initial_species
+            st.caption("初回は候補のある分類群から1種ずつ選択します。自由に追加・解除できます。「選び直す」を押すと現在の選択を各群1種に戻します。")
             saved_selection = set(selection_store.get(ortholog_gene, [])) & set(filtered_species)
             species_list = []
             for group in visible_groups:
                 group_species = sorted({item["species"] for item in classified_groups.get(group, [])})
                 with st.expander(f"{group_icons[group]} {group}（{len(group_species)}種）", expanded=False):
-                    if species_query:
-                        st.caption("一覧は全種を表示しています。🔎 は検索語に一致した種です。")
                     for species in group_species:
-                        matched = species_query and species_query in species_label(species).casefold()
                         checkbox_key = f"group_species::{ortholog_gene}::{group}::{species}"
                         if checkbox_key not in st.session_state:
                             st.session_state[checkbox_key] = species in saved_selection
-                        if matched:
-                            st.caption(f"🔎 検索一致：{species}")
                         checked = st.checkbox(
                             species,
                             key=checkbox_key,
@@ -363,8 +426,16 @@ if (
             selection_store[ortholog_gene] = species_list
             if species_list:
                 with st.expander(f"系統樹に使用する生物を確認（{len(species_list)}種）", expanded=False):
+                    st.caption("チェックを外すと、その生物を解析対象から除外します。分類群や検索結果の選択にも反映されます。")
                     for species in species_list:
-                        st.write(f"・{species}")
+                        selected_key = f"selected_species::{ortholog_gene}::{species}"
+                        st.session_state[selected_key] = True
+                        st.checkbox(
+                            species,
+                            key=selected_key,
+                            on_change=update_species_from_search,
+                            args=(ortholog_gene, species, selection_mode, selected_key, classified_groups),
+                        )
 
         else:
 
@@ -410,17 +481,25 @@ if (
                 key="species_all"
             )
 
-        if species_query:
-            search_pool = filtered_species if selection_mode == "🗂️ 分類群から選ぶ" else species_options
-            matches = [species for species in search_pool
-                       if species_query in species_label(species).casefold()]
-            remaining = [species for species in matches if species not in species_list]
-            st.write(f"**検索結果：{len(matches)}種（選択済み {len(matches) - len(remaining)}種 / 追加可能 {len(remaining)}種）**")
-            for species in matches:
-                status = "選択済み" if species in species_list else "未選択：上の分類群一覧または選択欄から追加できます"
-                st.write(f"・{species} — {status}")
-            if matches and not remaining and selection_mode == "🔍 すべての生物から選ぶ":
-                st.info("検索に一致する種はすべて選択済みです。選択欄の「No results」は、追加できる候補がないことを示します。")
+        with search_results:
+            if species_query:
+                search_pool = filtered_species if selection_mode == "🗂️ 分類群から選ぶ" else species_options
+                matches = [species for species in search_pool
+                           if species_query in species_label(species).casefold()]
+                remaining = [species for species in matches if species not in species_list]
+                st.write(f"**「{applied_query}」の検索結果：{len(matches)}種（選択済み {len(matches) - len(remaining)}種 / 追加可能 {len(remaining)}種）**")
+                if not matches:
+                    st.info("一致する生物種がありません。学名や検索語を変えてお試しください。")
+                st.caption("ここでチェックした種を系統樹に使用します。下の選択欄とも連動します。")
+                for species in matches:
+                    result_key = f"search_species::{ortholog_gene}::{selection_mode}::{species}"
+                    st.session_state[result_key] = species in species_list
+                    st.checkbox(
+                        species,
+                        key=result_key,
+                        on_change=update_species_from_search,
+                        args=(ortholog_gene, species, selection_mode, result_key, classified_groups),
+                    )
 
         st.write(
             f"**選択中：{len(species_list)}種**"
@@ -624,13 +703,19 @@ NCBI Orthologで **{gene} のオルソログを確認できませんでした。
 
             plt.tight_layout()
 
-            st.pyplot(fig)
-
-            plt.close(fig)
-
-            st.caption(
-                f"Tree file: {tree_file}"
-            )
+            try:
+                png = BytesIO()
+                pdf = BytesIO()
+                fig.savefig(png, format="png", dpi=300, bbox_inches="tight")
+                fig.savefig(pdf, format="pdf", bbox_inches="tight")
+                st.session_state["completed_tree"] = {
+                    "gene": gene,
+                    "png": png.getvalue(),
+                    "pdf": pdf.getvalue(),
+                    "newick": Path(tree_file).read_bytes(),
+                }
+            finally:
+                plt.close(fig)
 
         except Exception as e:
 
@@ -639,3 +724,24 @@ NCBI Orthologで **{gene} のオルソログを確認できませんでした。
             )
 
             st.exception(e)
+
+
+# Keep the completed result available across widget and download reruns.
+if "completed_tree" in st.session_state:
+    result = st.session_state["completed_tree"]
+    result_gene = result["gene"]
+    st.subheader(f"🌳 保存済みの解析結果：{result_gene}")
+    st.image(result["png"])
+    st.caption("最後に完成した系統樹です。入力や生物種を変更した場合は、再度作成してください。")
+    for label, extension, mime, field in (
+        ("📷 画像をダウンロード（PNG）", "png", "image/png", "png"),
+        ("📄 PDFをダウンロード", "pdf", "application/pdf", "pdf"),
+        ("🌳 系統樹データをダウンロード（Newick）", "nwk", "text/plain", "newick"),
+    ):
+        st.download_button(
+            label,
+            data=result[field],
+            file_name=f"{result_gene}_tree.{extension}",
+            mime=mime,
+            key=f"tree_download_{field}",
+        )

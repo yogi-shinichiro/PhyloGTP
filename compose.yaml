@@ -44,8 +44,11 @@ services:
       - analysis-data:/home/mambauser/data
     stop_grace_period: 20s
     depends_on:
+      ollama:
+        condition: service_healthy
       model-init:
         condition: service_completed_successfully
 volumes:
   analysis-data:
   ollama-models:
+

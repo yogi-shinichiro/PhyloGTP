@@ -3,6 +3,40 @@ from Bio import Entrez
 import xml.etree.ElementTree as ET
 import json
 import urllib.request
+import urllib.error
+import http.client
+import time
+from contextlib import closing
+
+
+class GeneInfoConnectionError(RuntimeError):
+    """NCBI could not be reached after bounded retries."""
+
+
+class GeneNotFoundError(ValueError):
+    """No human gene record matched the query."""
+
+
+def _read_ncbi(open_handle, decode, attempts=3):
+    # Retry the read as well as opening the connection; always close handles.
+    for attempt in range(attempts):
+        try:
+            with closing(open_handle()) as handle:
+                return decode(handle)
+        except urllib.error.HTTPError as exc:
+            if exc.code != 429 and not 500 <= exc.code < 600:
+                raise
+            last_error = exc
+        except (http.client.RemoteDisconnected, http.client.IncompleteRead,
+                ConnectionError, TimeoutError, urllib.error.URLError) as exc:
+            last_error = exc
+        if attempt + 1 < attempts:
+            time.sleep(2 ** (attempt + 1))
+    raise GeneInfoConnectionError(
+        "NCBIへの接続が切断されたか、応答を取得できませんでした。"
+        "自動再試行後も取得できないため、少し待って再試行してください。"
+    ) from last_error
+
 
 from settings import configure_entrez
 configure_entrez()
@@ -19,14 +53,10 @@ def get_gene_info(gene_symbol):
         f'AND "Homo sapiens"[Organism]'
     )
 
-    handle = Entrez.esearch(
-        db="gene",
-        term=query,
-        retmax=1
+    result = _read_ncbi(
+        lambda: Entrez.esearch(db="gene", term=query, retmax=1),
+        Entrez.read,
     )
-
-    result = Entrez.read(handle)
-    handle.close()
 
     if not result["IdList"]:
         return None
@@ -38,14 +68,10 @@ def get_gene_info(gene_symbol):
     # 2. Geneレコードを取得
     # ==========================
 
-    handle = Entrez.efetch(
-        db="gene",
-        id=gene_id,
-        rettype="xml"
+    xml_data = _read_ncbi(
+        lambda: Entrez.efetch(db="gene", id=gene_id, rettype="xml"),
+        lambda handle: handle.read(),
     )
-
-    xml_data = handle.read()
-    handle.close()
 
     root = ET.fromstring(xml_data)
 
